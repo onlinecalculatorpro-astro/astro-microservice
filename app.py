@@ -130,34 +130,61 @@ def natal():
             name = swe.get_planet_name(pid)
             planets[name] = {"error": str(e)}
 
-    # --- Houses / Angles (Placidus) -----------------------------------------
+        # --- Houses / Angles (Placidus) -----------------------------------------
     houses = None
     angles = {}
+
+    def _normalize_cusps(raw):
+        """Return a list of 12 cusps in degrees [C1..C12], regardless of shape."""
+        if not raw:
+            return None
+        # Convert tuple -> list
+        cs = list(raw)
+        # Case A: 13 long with dummy at 0 (classic pyswisseph)
+        if len(cs) >= 13:
+            vals = cs[1:13]
+        # Case B: exactly 12 long (0..11)
+        elif len(cs) == 12:
+            vals = cs[:]
+        else:
+            # Unexpected shape – bail safely
+            return None
+        return [round(norm360(v), 4) for v in vals]
+
+    def _angles_from_ascmc(raw):
+        """Extract ASC/MC safely from ascmc array."""
+        if not raw:
+            return {"error": "ascmc unavailable"}
+        arr = list(raw)
+        # Most builds: ASC at idx 0, MC at idx 1; but guard by length
+        asc_lon = norm360(arr[0]) if len(arr) > 0 else None
+        mc_lon  = norm360(arr[1]) if len(arr) > 1 else None
+        out = {}
+        if asc_lon is not None:
+            s, d = to_sign(asc_lon)
+            out["ASC"] = {"lon": asc_lon, "sign": s, "deg_in_sign": round(d, 4)}
+        if mc_lon is not None:
+            s, d = to_sign(mc_lon)
+            out["MC"] = {"lon": mc_lon, "sign": s, "deg_in_sign": round(d, 4)}
+        if not out:
+            out["error"] = "ASC/MC not present in ascmc"
+        return out
+
     try:
-        # swe.houses returns (cusps, ascmc) for a given JD(UT), lat, lon, sys
-        # 'P' = Placidus
-        cusps, ascmc = swe.houses(jd_ut, lat, lon, b'P')
+        # Prefer houses_ex for better compatibility; fall back to houses
+        cusps = ascmc = None
+        try:
+            # flags: use Swiss ephemeris; you can OR more flags if needed
+            cusps, ascmc = swe.houses_ex(jd_ut, swe.FLG_SWIEPH, lat, lon, b'P')
+        except Exception:
+            cusps, ascmc = swe.houses(jd_ut, lat, lon, b'P')
 
-        houses = [round(norm360(cusps[i+1]), 4) for i in range(12)]  # 1..12
+        houses = _normalize_cusps(cusps)
+        angles = _angles_from_ascmc(ascmc)
 
-        asc_lon = norm360(ascmc[0])  # ASC
-        mc_lon  = norm360(ascmc[1])  # MC
+        if houses is None:
+            raise RuntimeError("House cusps array had unexpected length/shape.")
 
-        asc_sign, asc_deg = to_sign(asc_lon)
-        mc_sign, mc_deg   = to_sign(mc_lon)
-
-        angles = {
-            "ASC": {
-                "lon": asc_lon,
-                "sign": asc_sign,
-                "deg_in_sign": round(asc_deg, 4)
-            },
-            "MC": {
-                "lon": mc_lon,
-                "sign": mc_sign,
-                "deg_in_sign": round(mc_deg, 4)
-            }
-        }
     except Exception as e:
         houses = None
         angles = {"error": str(e)}
