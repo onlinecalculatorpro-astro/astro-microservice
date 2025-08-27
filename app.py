@@ -1,21 +1,15 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
-import datetime as dt
-
-# Swiss Ephemeris (pyswisseph)
 import swisseph as swe
+import datetime
 
 app = Flask(__name__)
-CORS(app)
 
-# -----------------------------
-# Swiss Ephemeris configuration
-# -----------------------------
-# Allow an override path for .se1/.se2 files if you later mount them.
-EPHE_PATH = os.environ.get("EPHE_PATH", "").strip()
-if EPHE_PATH:
-    swe.set_ephe_path(EPHE_PATH)  # Safe if path exists; else SwissEphem uses built-in files
+# ---- Config -------------------------------------------------
+# If you later upload ephemeris files, set an absolute path here.
+# For now we let Swiss Ephemeris use its built-in computation.
+# swe.set_ephe_path("/app/se")  # e.g., when you add ephemeris files
+
+FLAGS = swe.FLG_SWIEPH | swe.FLG_SPEED  # Swiss ephemeris, include speeds
 
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -24,148 +18,159 @@ SIGNS = [
 
 PLANETS = [
     swe.SUN, swe.MOON, swe.MERCURY, swe.VENUS, swe.MARS,
-    swe.JUPITER, swe.SATURN, swe.URANUS, swe.NEPTUNE, swe.PLUTO,
+    swe.JUPITER, swe.SATURN, swe.URANUS, swe.NEPTUNE, swe.PLUTO
 ]
 
-PLANET_NAMES = {p: swe.get_planet_name(p) for p in PLANETS}
+# ---- Helpers ------------------------------------------------
+def norm360(x: float) -> float:
+    """Normalize degrees to [0, 360)."""
+    x = float(x) % 360.0
+    if x < 0:
+        x += 360.0
+    return x
 
+def to_sign(deg: float):
+    """Return (sign_name, degree_within_sign) for an ecliptic longitude."""
+    d = norm360(deg)
+    idx = int(d // 30)
+    within = d - idx * 30
+    return SIGNS[idx], within
 
-def sign_of(longitude_deg: float) -> str:
-    """Return zodiac sign name for a 0..360 longitude."""
-    i = int((longitude_deg % 360.0) // 30)
-    return SIGNS[i]
+def parse_ymd(date_str: str):
+    """YYYY-MM-DD -> (y, m, d). Raise ValueError on bad format."""
+    y, m, d = map(int, date_str.split("-"))
+    return y, m, d
 
+def parse_hm(time_str: str):
+    """HH:MM -> (h, m). Raise ValueError on bad format."""
+    h, m = map(int, time_str.split(":"))
+    return h, m
 
-def parse_input(json):
-    """Validate and normalize incoming JSON. Raises ValueError with human messages."""
-    if not isinstance(json, dict):
-        raise ValueError("Expected JSON object payload.")
-
-    # Required string fields
-    for k in ("date", "time"):
-        if not json.get(k):
-            raise ValueError(f"Missing required field: '{k}'")
-
-    date_str = str(json["date"])  # 'YYYY-MM-DD'
-    time_str = str(json["time"])  # 'HH:MM' (24h); seconds optional "HH:MM:SS"
-
-    # Lat/Lon: Swiss Ephem uses east-longitudes positive, west negative.
-    # Provide clear error if not numbers.
-    try:
-        lat = float(json.get("lat"))
-        lon = float(json.get("lon"))
-    except Exception:
-        raise ValueError("Fields 'lat' and 'lon' must be numbers.")
-
-    # Optional seconds
-    parts = time_str.split(":")
-    if len(parts) not in (2, 3):
-        raise ValueError("Time must be HH:MM or HH:MM:SS (24-hour).")
-    hour, minute = int(parts[0]), int(parts[1])
-    second = int(parts[2]) if len(parts) == 3 else 0
-
-    # Parse date
-    try:
-        year, month, day = map(int, date_str.split("-"))
-    except Exception:
-        raise ValueError("Date must be YYYY-MM-DD.")
-
-    # Build a naive UTC datetime (expecting the provided time is already UTC).
-    # If you need timezone conversion later, pass a tz offset from the client.
-    utc_dt = dt.datetime(year, month, day, hour, minute, second)
-
-    # Convert to Julian Day (UT); Swiss Ephem wants fractional hours
-    ut_hours = hour + minute / 60.0 + second / 3600.0
-    jd_ut = swe.julday(year, month, day, ut_hours)
-
-    return {
-        "jd_ut": jd_ut,
-        "lat": lat,
-        "lon": lon,
-        "dt": utc_dt.isoformat() + "Z",
-    }
-
-
-@app.route("/", methods=["GET"])
-def index():
+# ---- Routes -------------------------------------------------
+@app.route("/")
+def root():
     return jsonify({
         "service": "astro-microservice",
         "status": "ok",
+        "ephemeris_path": "(default)",
         "endpoints": {
             "health": "/healthz",
-            "natal": {"path": "/natal", "method": "POST"}
-        },
-        "ephemeris_path": EPHE_PATH or "(default)"
-    }), 200
+            "natal": {"method": "POST", "path": "/natal"}
+        }
+    })
 
-
-@app.route("/healthz", methods=["GET"])
+@app.route("/healthz")
 def healthz():
-    return jsonify({"status": "ok"}), 200
-
+    return jsonify({"status": "ok"})
 
 @app.route("/natal", methods=["POST"])
 def natal():
-    """
-    Request JSON:
-    {
-      "date": "1995-06-15",
-      "time": "03:15",          # assumed UTC; or pass already converted time
-      "lat": 19.0760,           # latitude (+N, -S)
-      "lon": 72.8777            # longitude (+E, -W)
-    }
-    """
     try:
-        data = request.get_json(silent=True)
-        parsed = parse_input(data)
+        if not request.is_json:
+            return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
 
-        jd = parsed["jd_ut"]
-        lat = parsed["lat"]
-        lon = parsed["lon"]
+        data = request.get_json(silent=True) or {}
 
-        # Planetary longitudes (tropical, geocentric, apparent, true node etc. default flags)
-        planets = {}
-        for body in PLANETS:
-            # swe.calc_ut returns (lon, lat, dist, speed_lon, speed_lat, speed_dist)
-            lon_deg, lat_deg, _dist = swe.calc_ut(jd, body)[:3]
-            name = PLANET_NAMES[body]
-            planets[name] = {
-                "lon": round(lon_deg % 360.0, 6),
-                "sign": sign_of(lon_deg),
+        # Required
+        date_str = data.get("date")  # "YYYY-MM-DD" (UTC date, unless tz_offset provided)
+        time_str = data.get("time")  # "HH:MM" in 24h
+        lat = data.get("lat")
+        lon = data.get("lon")
+
+        if not date_str or not time_str or lat is None or lon is None:
+            return jsonify({
+                "ok": False,
+                "error": "Missing required fields: 'date', 'time', 'lat', 'lon'"
+            }), 400
+
+        # Optional: timezone offset in HOURS (e.g., 5.5 for IST). Default UTC.
+        tz_offset = float(data.get("tz_offset", 0))
+
+        # Parse
+        year, month, day = parse_ymd(date_str)
+        hour, minute = parse_hm(time_str)
+        lat = float(lat)
+        lon = float(lon)
+
+        # Build UT (UTC) time: local time minus tz_offset
+        # (e.g., 14:30 local with tz_offset +5.5 -> 09:00 UT)
+        ut_hours = hour + minute / 60.0 - tz_offset
+
+        # Julian day in UT
+        jd_ut = swe.julday(year, month, day, ut_hours)
+
+        # ---- Planets (longitudes) -----------------------------------------
+        planets_out = {}
+        for pl in PLANETS:
+            try:
+                pos, ret = swe.calc_ut(jd_ut, pl, FLAGS)
+                lon_deg = float(pos[0])
+                sign_name, deg_in_sign = to_sign(lon_deg)
+                planets_out[swe.get_planet_name(pl)] = {
+                    "lon": round(norm360(lon_deg), 4),
+                    "sign": sign_name,
+                    "deg_in_sign": round(deg_in_sign, 4)
+                }
+            except Exception as e:
+                planets_out[str(pl)] = {"error": str(e)}
+
+        # ---- Houses / Angles (Placidus) -----------------------------------
+        # Returns (cusps[1..12], ascmc[0..9])  where ascmc[0]=Asc, ascmc[1]=MC
+        # Lon is geographic longitude (east positive). Swiss Ephemeris expects east-positive,
+        # which matches common GIS. If yours is west-positive, negate it.
+        try:
+            cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b'P', FLAGS)
+            houses = [None] * 12
+            for i in range(12):
+                c = float(cusps[i+1])  # cusps array is 1-indexed
+                houses[i] = round(norm360(c), 4)
+
+            asc_lon = float(ascmc[0])
+            mc_lon = float(ascmc[1])
+            asc_sign, asc_deg = to_sign(asc_lon)
+            mc_sign, mc_deg = to_sign(mc_lon)
+
+            angles = {
+                "ASC": {
+                    "lon": round(norm360(asc_lon), 4),
+                    "sign": asc_sign,
+                    "deg_in_sign": round(asc_deg, 4)
+                },
+                "MC": {
+                    "lon": round(norm360(mc_lon), 4),
+                    "sign": mc_sign,
+                    "deg_in_sign": round(mc_deg, 4)
+                }
             }
+        except Exception as e:
+            houses = None
+            angles = {"error": str(e)}
 
-        # Houses + angles (Placidus by default). Returns (cusps[1..12], ascmc[ASC, MC, ARMC, Vertex, Equatorial Asc, Co-Asc1, Co-Asc2, Polar Asc])
-        cusps, ascmc = swe.houses(jd, lat, lon)
-        asc = ascmc[0] % 360.0
-        mc = ascmc[1] % 360.0
-
-        angles = {
-            "Ascendant": {"lon": round(asc, 6), "sign": sign_of(asc)},
-            "MC": {"lon": round(mc, 6), "sign": sign_of(mc)},
+        # Quick “top 3” summary
+        top3 = {
+            "sun_sign": planets_out.get("Sun", {}).get("sign"),
+            "moon_sign": planets_out.get("Moon", {}).get("sign"),
+            "asc_sign": angles.get("ASC", {}).get("sign") if isinstance(angles, dict) else None
         }
-
-        houses = {f"H{i}": round((cusps[i - 1] % 360.0), 6) for i in range(1, 13)}
 
         return jsonify({
             "ok": True,
-            "input": {
-                "datetime_utc": parsed["dt"],
-                "lat": lat,
-                "lon": lon
+            "meta": {
+                "jd_ut": jd_ut,
+                "tz_offset_hours": tz_offset
             },
-            "planets": planets,
+            "planets": planets_out,
             "angles": angles,
-            "houses": houses
-        }), 200
+            "houses": houses,
+            "summary": top3
+        })
 
     except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
+        return jsonify({"ok": False, "error": f"Bad input: {ve}"}), 400
     except Exception as e:
-        # For production you might want to hide raw exception details.
-        return jsonify({"ok": False, "error": f"Server error: {str(e)}"}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# Local run (Render/Heroku use gunicorn via Procfile)
 if __name__ == "__main__":
-    # Local dev; in Render we use gunicorn (see Procfile)
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
